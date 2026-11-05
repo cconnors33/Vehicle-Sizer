@@ -7,15 +7,11 @@ FluidTables/*.h5
 AeroTables/*.h5
 !AeroTables/canardmodel.h5
 tests/*
-!tests/test_phase_change_rejection.py
-!tests/test_battery_sizing.py
-!tests/test_examples_independence.py
-!tests/test_gas_generator.py
-!tests/test_sensitivity_plots.py
-!tests/test_sensitivity_runner.py
-!tests/test_canards.py
-!tests/test_feed_sizing.py
+
 
 .venv/
 
 !tests/test_tank_wall_allowance.py
+
+!tests/test_optimizer_slsqp.py
+!tests/test_tank_volume_experiment.py

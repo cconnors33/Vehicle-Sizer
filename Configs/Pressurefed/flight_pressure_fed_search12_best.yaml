@@ -1,0 +1,262 @@
+# Pressure-fed design: pressure_fed_search12_refinement_03 best, evaluation 85.
+# Saved at dt=0.5 s; dt=0.25 s verification returned 1.99811 calibers minimum stability.
+
+simulation:
+  dt: 0.5
+  fluid_solve_post_shutdown: false
+  output: outputs/flight_pressure_fed_regulator.csv
+  plot: outputs/flight_pressure_fed_regulator.png
+  t_end: 600.0
+launch:
+  altitude: 1191.0
+  rail_height: 15.0
+  rail_inclination_deg: 90.0
+  velocity: 0.0
+environment:
+  wind:
+    enabled: true
+    profile: AeroTables/WindProfiles/RAP_HWM.csv
+  altitude_step: 100.0
+  max_altitude: 300000.0
+vehicle:
+  OMLD: 0.31115
+  dx: 0.01
+  sections:
+  - name: nosecone
+    type: nosecone
+    masses:
+      parachute: 4.46
+      parachute_hardware: 10.0
+      titanium_tip: 2.0
+      counterweight: 7.742731459148238
+  - name: avi_bay
+    type: avi_bay
+    masses:
+      cube: 5.0
+      clamshell: 1.59
+      mounting: 2.0
+  - name: COPV
+    tank_id: press_tank
+    type: press_tank
+    masses:
+      press_tank_shell: 8.25
+      mounting: 2.0
+      fitting: 1.0
+  - name: IT1
+    length: 0.2794
+    type: inter_tank
+    masses:
+      stringers: 0.88
+      clamshell: 2.06
+      components: 6.0
+    stiffness_EI: 3270000.0
+  - name: oxidizer_tank
+    tank_id: ox_tank
+    type: prop_tank
+    masses:
+      pass_through_hardware: 2.0
+  - name: IT2
+    length: 0.3302
+    type: inter_tank
+    masses:
+      stringers: 0.74
+      clamshell: 1.75
+      components: 5.0
+      canards: 4.0
+    stiffness_EI: 3270000.0
+  - name: fuel_tank
+    tank_id: fuel_tank
+    type: prop_tank
+    masses:
+      pass_through_hardware: 2.0
+  - name: IT3
+    length: 0.3048
+    type: inter_tank
+    masses:
+      stringers: 0.81
+      clamshell: 1.9
+      main_valves: 6.0
+      tubing_solenoids: 3.0
+      thrust_structure: 3.0
+    stiffness_EI: 3270000.0
+  - name: fin_can
+    type: fin_can
+    masses:
+      hardware: 2.0
+nosecone:
+  wall_thickness: 0.00635
+  fineness_ratio: 5.962889473019543
+  material: carbon_fiber
+  profile: von_karman
+  tip_radius: 0.01
+avi_bay:
+  length: 0.25
+inter_tank:
+  stringer_count: 4
+  stringer_material: aluminum_7075
+fin_can:
+  boattail_aft_diameter: 0.27896114988136606
+  boattail_length: 0.5400125094145363
+  boattail_wall_thickness: 0.00318
+  fin_count: 4
+  fin_thickness: 0.0076
+  material: carbon_fiber
+  root_chord: 0.508
+  span: 0.2980845451219718
+  sweep_fraction: 0.7815282920152096
+  tip_chord: 0.2032
+engine:
+  cf_efficiency: 0.95
+  cstar_efficiency: 0.9
+  exit_pressure: 59096.95801911459
+  fuel: RP-1
+  length: 0.45
+  mass: 25.0
+  oxidizer: LOX
+prop_system:
+  MR_target: 2.1742499551880994
+  Pc_target: 1759943.716457859
+  fuel_inj_stiffness: 0.24
+  fuel_system_cda: 0.00017847509401684
+  initial_conditions:
+    fuel_tank:
+      T: 298.15
+      fluid: n-Dodecane
+      gas_T: 298.15
+      gas_fluid: Nitrogen
+    ox_tank:
+      T: 100.0
+      fluid: Oxygen
+      gas_T: 293.0
+      gas_fluid: Nitrogen
+    press_tank:
+      T: 298.15
+      fluid: Nitrogen
+  nozzle_cd: 1.0
+  ox_inj_stiffness: 0.24
+  ox_system_cda: 0.00042886656742644
+  regulator:
+    FUEL_REGULATOR:
+      eol_temperature: 150.0
+      capacity_factor: 15.0
+      collapse_factor: 1.2
+      tank_id: fuel_tank
+    OX_REGULATOR:
+      eol_temperature: 150.0
+      capacity_factor: 15.0
+      collapse_factor: 1.4
+      tank_id: ox_tank
+  template: Configs/templates/pressure_fed_regulator.yaml
+  thrust_target: 26178.49159384874
+tanks:
+  fuel_tank:
+    thermal:
+      model: None
+    ellipse_ratio: 1.75
+    material: aluminum_6061
+    passthrough_diameter: 0.0635
+    passthrough_wall_thickness: 0.002286
+    propellant_mass: 93.1249687554799
+    type: propellant
+    ullage_factor: 1.1
+    min_wall_thickness: 0.00254
+    min_temperature: 80.0
+    min_pressure: 68947.57293168
+  ox_tank:
+    thermal:
+      model: None
+    ellipse_ratio: 1.75
+    material: aluminum_6061
+    passthrough_diameter: 0.0381
+    passthrough_wall_thickness: 0.002286
+    propellant_mass: 215.7980907391658
+    type: propellant
+    ullage_factor: 1.1
+    min_wall_thickness: 0.00254
+    min_temperature: 80.0
+    min_pressure: 68947.57293168
+  press_tank:
+    thermal:
+      model: None
+    design_pressure: 21627914.667066757
+    ellipse_ratio: 1.75
+    outer_diameter: 0.2794
+    type: pressurant
+    construction: copv
+    volume: 0.055
+    thickness_slope: 0.03
+    thickness_intercept: 0.004
+    equivalent_density: 2238.6
+    min_pressure: 1.034e6
+    min_temperature: 120.0
+    mass: 29.5
+aero:
+  drag_multiplier: 1.1
+  q_cutoff_Pa: 0.01
+  finish: 30um
+  fins_on_boattail: true
+  model: AeroTables/dragmodel.h5
+  nose: vonkarman
+roll:
+  fin_cant: 0.00174533
+canards:
+  section: IT2
+  offset_m: 0.05
+  root_chord_m: 0.25
+  max_deflection_deg: 10.0
+  control_start_time_s: 0.0
+  net_roll_multiplier: 0.5
+  aero:
+    cd0: 0.2
+    oswald: 0.4
+    deflection_drag_multiplier: 2.0
+thermal:
+  initial_temperature: 288.15
+  material_overrides:
+    fiberglass:
+      specific_heat: 800.0
+  sink_temperature: 288.15
+property_models:
+  combustion:
+    source: table
+    table:
+      lookup_file: FluidTables/sizer_lookups.h5
+      nfz: 2
+  pure_fluid:
+    source: table
+    table:
+      fluids:
+        Nitrogen:
+          pt: nitrogen_pt
+          saturation: nitrogen_saturation
+        Oxygen: oxygen_pt
+        n-Dodecane: ndodecane_pt
+      lookup_file: FluidTables/sizer_lookups.h5
+advanced:
+  flight:
+    trial_max_retries: 10
+    trial_min_dt: 1.0e-06
+    event_max_iterations: 50
+    event_time_tolerance: 1.0e-06
+  fluid_network:
+    jacobian: colored
+    max_step: 1.0
+    residual_retries: 3
+    residual_tolerance: 1.0e-05
+    retry_rtol_factor: 0.1
+    retry_rtol_floor: 1.0e-08
+    rtol: 1.0e-05
+  heating:
+    convergence_tolerance: 0.001
+    max_iterations: 20
+    temperature_tolerance: 0.01
+  tank_wall_thickness_allowance: 0.000254
+  t_wall_min: 0.001
+  tank_pressure_fos: 1.5
+  weld_allowable: 234400000.0
+  endcap_mass_multiplier: 1.5
+constraints:
+  max_length_to_diameter: 31.0
+  min_stability_calibers: 2.0
+  goal_apogee: 130000.0
+  max_burn_duration: 75.0

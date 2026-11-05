@@ -4,84 +4,33 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from dataclasses import asdict
+from functools import lru_cache
 import json
-from math import isfinite, pi, sqrt, nextafter
+from math import isfinite
 from pathlib import Path
 import time
 import traceback
 from collections import Counter, deque
 from diagnostics.errors import failure_details, SearchFailureLimit, LookupBoundsError, UnsupportedPhaseChangeError
 
+from scipy.optimize import minimize
 from scipy.optimize._differentialevolution import DifferentialEvolutionSolver
 import yaml
+import numpy as np
 
 from AeroTables import DragModel
 from AeroTables.dragmodel import _end as aero_endpoint
 from Configs.loader import load_config
 from diagnostics.constraints import ConstraintRecord, configured_limits
-from Vehicle.utils.geometry import pressure_wall_thickness, tank_capacity
 from diagnostics.errors import EvaluationFailure, GeometryError
-from Fluids.helpers.templates import bind_template, read_template
-from Fluids.design import prepare_design_inputs
-from Vehicle.sections.PressTank import PressTank
 from simulation import project_path, simulate
 from FluidTables.PropertyModels import property_sources, TableCombustionPropertySource
 from simulation_types import SimResult
-
-INCH = 0.0254
-AERO_PATHS = {
-    "omld": "vehicle.OMLD", "fineness": "nosecone.fineness_ratio",
-    "boattail_aft": "fin_can.boattail_aft_diameter",
-    "boattail_length": "fin_can.boattail_length", "span": "fin_can.span",
-    "root": "fin_can.root_chord", "tip": "fin_can.tip_chord",
-    "sweep_fraction": "fin_can.sweep_fraction", "thickness": "fin_can.fin_thickness",
-}
-DIMENSIONLESS = {"fineness", "sweep_fraction"}
-
-
-def pump_roles(cfg):
-    """Find optimizer pump variables from the same wiring used by PropSystem."""
-    template = read_template(cfg)
-    if not any(branch["component"] == "pump" for branch in template["branches"].values()):
-        return {}  # Pressure-fed CdA inputs are resolved later during design preparation.
-    template = bind_template(dict(cfg, prop_system=dict(cfg["prop_system"], template=template)))
-    roles = {}
-    for branch in template['branches'].values():
-        if branch['component'] != 'pump':
-            continue
-        role = template['circuits'][branch['circuit']]['prop']
-        if role not in ('oxidizer', 'fuel') or role in roles:
-            raise ValueError('Optimizer supports at most one pump per propellant role')
-        roles[role] = branch['pump_id']
-    return roles
-
-
-def variable_paths(cfg, tank_ids):
-    paths = dict(AERO_PATHS)
-    paths.update(chamber_pressure="prop_system.Pc_target", mixture_ratio="prop_system.MR_target",
-                 thrust="prop_system.thrust_target", exit_pressure="engine.exit_pressure")
-    pumps = pump_roles(cfg)
-    for role in ("oxidizer", "fuel"):
-        if role in pumps:
-            pump = pumps[role]
-            paths[f"{role}_pump_head"] = f"prop_system.pumps.{pump}.pressure_rise_pa"
-        paths[f"{role}_mass"] = f"tanks.{tank_ids[role]}.propellant_mass"
-    paths.update(copv_pressure=f"tanks.{tank_ids['pressurant']}.design_pressure",
-                 copv_volume=f"tanks.{tank_ids['pressurant']}.volume")
-    return paths
-
-
-def get_path(cfg, path):
-    for key in path.split("."):
-        cfg = cfg[key]
-    return cfg
-
-
-def set_path(cfg, path, value):
-    *parents, key = path.split(".")
-    for parent in parents:
-        cfg = cfg[parent]
-    cfg[key] = value
+from optimizer.coordinates import (CoordinateSpace, INCH, AERO_PATHS, DIMENSIONLESS,
+                                   pump_roles, variable_paths, get_path, set_path,
+                                   pressurant_inner_radius)
+from optimizer.objectives import (candidate_class, soft_penalties, objective,
+                                  ranked_score as candidate_score, constraint_margins)
 
 
 def aero_bounds(model):
@@ -114,89 +63,6 @@ def domain_records(candidate, model):
             margin * factor,
             "AeroTables", "sizing", "1" if name in DIMENSIONLESS else "m")
     return records
-
-
-def pressurant_inner_radius(cfg, tank):
-    """Match the selected vessel's wall model before checking its capacity."""
-    diameter = float(tank["outer_diameter"])
-    wall, _ = PressTank.wall_sizing(cfg, tank)
-    radius = diameter / 2 - wall
-    if not isfinite(radius) or radius <= 0 or tank["ellipse_ratio"] <= 1:
-        raise ValueError("Invalid pressurant diameter, sized wall or ellipse ratio")
-    return radius
-
-
-def candidate_class(result):
-    """Missing/unresolved physics must never outrank a fully assessed flight."""
-    if result.accepted:
-        return "feasible"
-    if result.termination == "infeasible_initial_design":
-        return "preflight_rejected"
-    if (not result.completed or not result.burn_complete
-            or not {"goal_apogee", "max_burn_duration"} <= result.constraint_records.keys()
-            or any(r.required and r.margin is None for r in result.constraint_records.values())):
-        return "unresolved"
-    return "completed_infeasible"
-
-
-def soft_penalties(result, settings):
-    """Soft preferences never change feasibility; missing measurements cannot pass."""
-    policy = settings.get('soft_penalties', {})
-    penalties = {}
-    if 'downrange' in policy:
-        spec = policy['downrange']
-        if not result.apogee_reached or not isfinite(result.final_x):
-            raise ValueError('Downrange penalty requires a completed flight and finite displacement')
-        penalties['downrange'] = spec['weight'] * max(0., abs(result.final_x) - spec['target_m']) / spec['scale_m']
-    for tank, spec in policy.get('tank_pressure_tracking', {}).items():
-        record = result.pressure_tracking.get(tank)
-        if record is None or not isfinite(record['duration_s']) or record['duration_s'] <= 0:
-            raise ValueError(f'Missing powered pressure tracking for {tank}')
-        integral = record['integral_pa_s']
-        if not isfinite(integral) or integral < 0:
-            raise ValueError('Invalid pressure error integral')
-        penalties[f'tank.{tank}.pressure_tracking'] = spec['weight'] * integral / (spec['pressure_scale_pa'] * spec['time_scale_s'])
-    if 'max_q' in policy:
-        spec = policy['max_q']
-        if not isfinite(result.max_q) or result.max_q < 0:
-            raise ValueError('Invalid maximum dynamic pressure')
-        penalties['max_q'] = spec['weight'] * max(0., result.max_q - spec['target_pa']) / spec['scale_pa']
-    if 'stability_length_fraction' in policy:
-        spec = policy['stability_length_fraction']
-        lower, upper, scale, weight = (spec[k] for k in ('lower_target', 'upper_target', 'scale', 'weight'))
-        minimum, maximum = result.min_stability_length_fraction, result.max_stability_length_fraction
-        if (minimum is None or maximum is None or not all(isfinite(v) for v in (minimum, maximum))
-                or minimum > maximum):
-            raise ValueError('Missing or invalid stability length-fraction extrema')
-        penalties['stability_length_fraction'] = weight * (max(0., lower - minimum) + max(0., maximum - upper)) / scale
-    return penalties
-
-
-def candidate_score(result, settings):
-    """Return score, violations and penalties using prepared search settings."""
-    category = candidate_class(result)
-    if category == "feasible":
-        mass = result.initial_mass
-        if mass is None or not isfinite(mass) or mass <= 0:
-            raise ValueError("Accepted candidate has no finite positive launch mass")
-        penalties = soft_penalties(result, settings)
-        objective = mass / settings['reference_mass'] + sum(penalties.values())
-        return min(objective / (1. + objective), nextafter(1., 0.)), {}, penalties
-    contributions = {}
-    for key, record in result.constraint_records.items():
-        if not record.required or record.margin is None:
-            continue
-        scale = settings["constraint_scales"].get(key, settings["unit_scales"].get(record.units))
-        if scale is None or not isfinite(scale) or scale <= 0:
-            raise ValueError(f"Missing positive violation scale for {key} ({record.units})")
-        if record.margin < 0:
-            contributions[key] = -record.margin / scale
-    if category == "unresolved":
-        return 3., contributions, {}
-    offset = 2. if category == "preflight_rejected" else 1.
-    violation = sum(contributions.values())
-    score = offset + (1. - 1. / (1. + violation))
-    return min(score, nextafter(offset + 1., offset)), contributions, {}
 
 
 class EvaluationBudget(Exception):
@@ -252,6 +118,45 @@ class GenerationBudgetSolver(DifferentialEvolutionSolver):
         return False
 
 
+def measurement(value, spec, unit=''):
+    if value is None or not isfinite(value):
+        return 'N/A'
+    return f'{value:{spec}}{unit}'
+
+
+class ProgressTracker:
+    """track progress!"""
+    def __init__(self, budget):
+        self.budget = budget
+        self.completed = 0
+        self.best_score = None
+        self.started = time.perf_counter()
+
+    def update(self, record):
+        self.completed += 1
+        score = record['score']
+        if record['accepted'] and (self.best_score is None or score < self.best_score):
+            self.best_score = score
+        elapsed = time.perf_counter() - self.started
+        candidate = record.get('evaluation', record.get('index', self.completed))
+        wall = record.get('wall_seconds', record.get('elapsed_seconds'))
+        print(
+            f"Run {self.completed}/{self.budget} | candidate={candidate}"
+            f" | score={measurement(score, '.6g')} | best={measurement(self.best_score, '.6g')}"
+            f" | apogee={measurement(record.get('apogee'), ',.1f', ' m')}"
+            f" | mass={measurement(record.get('mass'), '.2f', ' kg')}"
+            f" | sim={measurement(record.get('simulation_seconds'), '.2f', ' s')}"
+            f" | wall={measurement(wall, '.2f', ' s')}"
+            f" | total wall={elapsed:.1f} s | avg={elapsed / self.completed:.2f} s/run"
+            f" | accepted={record['accepted']} | {record['termination']}",
+            flush=True,
+        )
+
+    def event(self, kind, details):
+        """Report extra solver events without counting another evaluation."""
+        print(f"Search {kind} after {self.completed}/{self.budget} evaluations: {details}", flush=True)
+
+
 class Evaluator:
     def __init__(self, cfg, settings, model, pure, combustion, output):
         self.cfg, self.settings = deepcopy(cfg), settings
@@ -262,149 +167,52 @@ class Evaluator:
             if not low <= settings['bounds']['exit_pressure'][0] <= settings['bounds']['exit_pressure'][1] <= high:
                 raise ValueError(f'Exit-pressure bounds must lie in the common table sizing interval [{low}, {high}] Pa')
         self.output = Path(output)
-        self.paths = variable_paths(cfg, settings["tank_ids"])
-        self.names = list(self.paths)
-        self.bounds = [settings["bounds"][name] for name in self.names]
+        self.coordinates = CoordinateSpace(cfg, settings, model, pure, combustion)
+        self.paths = self.coordinates.paths
+        self.names = self.coordinates.names
+        self.bounds = self.coordinates.bounds
         self.count = 0
         self.best = None
-        self.population_size = None
-        self.started = time.perf_counter()
+        self.progress = ProgressTracker(settings["max_evaluations"])
         self.failure_monitor = FailureMonitor(settings.get('failure_policy'))
 
     def decode(self, values):
-        if len(values) != len(self.paths):
-            raise ValueError("Wrong design vector length")
-        cfg = deepcopy(self.cfg)
-        for value, (name, path), (low, high) in zip(values, self.paths.items(), self.bounds):
-            if not isfinite(value) or not low <= value <= high:
-                raise ValueError(f"Candidate {name} is outside configured bounds")
-            set_path(cfg, path, float(value))
-        if self.settings.get("conditional_geometry", False):
-            return self.condition_geometry(cfg, values)
-        return cfg
+        return self.coordinates.decode(values)
 
-    def condition_geometry(self, cfg, values):
-        """Map each box coordinate into its candidate-dependent physical interval.
-
-        User bounds remain hard limits. Empty intersections are explicit design
-        rejections, never clipping a derived nozzle or overriding a user bound.
-        """
-        coordinates = dict(zip(self.names, values))
-        def assign(name, minimum=-float("inf"), maximum=float("inf")):
-            lower, upper = self.settings["bounds"][name]
-            lo, hi = max(lower, minimum), min(upper, maximum)
-            if lo > hi:
-                raise GeometryError({f"geometry.bounds.{name}": hi - lo})
-            fraction = (coordinates[name] - lower) / (upper - lower) if upper > lower else 0.
-            value = float(lo + fraction * (hi - lo))
-            set_path(cfg, self.paths[name], value)
-            return value
-
-        clearance = float(cfg.get("geometry", {}).get("radial_clearance", 0.))
-        fin, engine, prop = cfg["fin_can"], cfg["engine"], cfg["prop_system"]
-        copv = cfg["tanks"][self.settings["tank_ids"]["pressurant"]]
-        margin = 2 * (fin["boattail_wall_thickness"] + clearance) + 1e-9
-        # The nozzle stays derived from the same CEA design calculation.
-        epsilon = self.combustion.expansion_ratio(prop["Pc_target"], prop["MR_target"], engine["exit_pressure"])
-        design = self.combustion.evaluate(chamber_pressure=prop["Pc_target"], mixture_ratio=prop["MR_target"],
-            ambient_pressure=engine["exit_pressure"], expansion_ratio=epsilon,
-            cstar_efficiency=engine["cstar_efficiency"], cf_efficiency=engine["cf_efficiency"])
-        thrust_per_area = prop["Pc_target"] * design.Cf / epsilon
-        exit_low = float(self.model.ranges["exit"][0]) * INCH
-        aft_max = min(self.settings["bounds"]["boattail_aft"][1], self.settings["bounds"]["omld"][1])
-        if aft_max <= margin:
-            raise GeometryError({"engine.nozzle": aft_max - margin})
-        thrust = assign("thrust", pi * exit_low**2 / 4 * thrust_per_area,
-                        pi * (aft_max - margin)**2 / 4 * thrust_per_area)
-        exit_diameter = sqrt(4 * thrust / thrust_per_area / pi)
-        diameter = assign("omld", max(exit_diameter + margin,
-            self.settings["bounds"]["boattail_aft"][0],
-            copv["outer_diameter"] + 2 * (clearance) + 1e-9))
-        # Span remains a physical length. Its permitted interval moves with D;
-        # intersect it with the user's bounds before mapping the search coordinate.
-        span_low, span_high = (aero_endpoint(bound, {"omld": diameter / INCH}) * INCH
-                               for bound in self.model.ranges["span"])
-        assign("span", span_low, span_high)
-        length = assign("boattail_length", max(engine["length"], self.settings["bounds"]["root"][0]))
-        aft_min = exit_diameter + margin
-        if engine.get("envelope_diameter") is not None:
-            envelope = engine["envelope_diameter"] + margin
-            if diameter < envelope:
-                raise GeometryError({"engine.envelope": diameter - envelope})
-            aft_min = max(aft_min, diameter + (envelope - diameter) * length / engine["length"])
-        assign("boattail_aft", aft_min, diameter)
-        root = assign("root", maximum=length)
-        assign("tip", maximum=root)
-        radius = pressurant_inner_radius(cfg, copv)
-        if copv.get("length") is None:
-            assign("copv_volume", 4 * pi * radius**3 / (3 * copv["ellipse_ratio"]) + pi * radius**2 * 1e-8)
-
-        if pump_roles(cfg):
-            for role, leg in (("oxidizer", "ox"), ("fuel", "fuel")):
-                outlet = prop["Pc_target"] * (1 + prop[f"{leg}_inj_stiffness"]) + prop[f"{leg}_inj_pumpout_dp"]
-                assign(f"{role}_pump_head", maximum=outlet - 1.)
-        # Match PropTank's pressure-sized wall and usable ellipsoidal-head volume.
-        _, states, wall_pressures = prepare_design_inputs(cfg, fluid_properties=self.pure, combustion_properties=self.combustion)
-        for role in ("oxidizer", "fuel"):
-            tank_id = self.settings["tank_ids"][role]
-            tank, state = cfg["tanks"][tank_id], states[tank_id]
-            pressure = wall_pressures[tank_id]
-            allowance = float(cfg["advanced"].get("tank_wall_thickness_allowance", 0.))
-            if not isfinite(allowance) or allowance < 0:
-                raise ValueError("Tank wall thickness allowance must be finite and nonnegative")
-            wall = tank.get("wall_thickness")
-            if wall is None:
-                wall = pressure_wall_thickness(pressure, diameter, cfg["advanced"]["tank_pressure_fos"],
-                                               cfg["advanced"]["weld_allowable"]) + allowance
-            radius, tube = diameter / 2 - wall, tank["passthrough_diameter"] / 2
-            if radius <= tube + clearance:
-                raise GeometryError({f"{tank_id}.passthrough": radius - tube - clearance})
-            head, cylinder_area = tank_capacity(radius, tube, tank["ellipse_ratio"])
-            rho = self.pure.state_pt(state["fluid"], state["P"], state["T"]).rho
-            assign(f"{role}_mass", (head + cylinder_area * 1e-8) * rho / tank["ullage_factor"])
-        return cfg
-
-    def evaluate(self, candidate, *, verification=False, progress=None):
+    def evaluate(self, candidate, *, progress=None):
         """Return (resolved config, simulation result, record), without search bookkeeping.
 
-        Search candidates are coordinates; verification takes the saved config
-        directly, bypassing coordinate decoding and conditional geometry.
+        Candidates are search coordinates decoded into physical configurations.
         """
         started = time.perf_counter()
         cfg, failure, details = None, None, None
         try:
-            cfg = deepcopy(candidate) if verification else self.decode(candidate)
-            if verification:
-                cfg["simulation"]["dt"] *= self.settings["verification_dt_factor"]
+            cfg = self.decode(candidate)
             (self.output / "candidate.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
             result = simulate(cfg, pure_properties=self.pure, combustion_properties=self.combustion,
                               aero_model=self.model, assess_constraints=True,
-                              compute_loads=verification, progress=progress)
-            if verification and result.max_altitude > cfg["environment"]["max_altitude"]:
-                raise ValueError("Verification exceeded atmosphere table")
+                              compute_loads=False, progress=progress)
         except GeometryError as error:
-            if verification:
-                raise
             result = rejection({k: ConstraintRecord(v, "optimizer", "sizing", "m") for k, v in error.constraints.items()})
         except Exception as error:
             phase = getattr(error, 'phase', 'sizing')
             details = failure_details(error, phase=phase)
             failure = traceback.format_exc()
-            suffix = "" if verification else f"_{self.count + 1:04d}"
+            suffix = f"_{self.count + 1:04d}"
             (self.output / f"failed{suffix}.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
             (self.output / f"failure{suffix}.txt").write_text(failure)
-            if (verification or details['fatal'] or not isinstance(
+            if (details['fatal'] or not isinstance(
                     error, (EvaluationFailure, LookupBoundsError, UnsupportedPhaseChangeError))):
                 if isinstance(error, EvaluationFailure):
                     raise
-                raise EvaluationFailure("optimizer verification" if verification else "optimizer evaluation", cfg) from error
+                raise EvaluationFailure("optimizer evaluation", cfg) from error
             result = deepcopy(getattr(error, 'partial_result', None) or SimResult())
             result.apogee = None
             result.termination = details['kind']
         score, contributions, penalties = candidate_score(result, self.settings)
         variables = ({name: get_path(cfg, path) for name, path in self.paths.items()} if cfg is not None else {})
         entry = dict(variables=variables,
-                     search_coordinates=[] if verification else list(map(float, candidate)), score_class=candidate_class(result), failure=failure,
+                     search_coordinates=list(map(float, candidate)), score_class=candidate_class(result), failure=failure,
                      failure_details=details,
                      battery_sizing=result.battery_sizing,
                      recovered_fluid_retries=result.fluid_retries, load_peaks=result.load_peaks,
@@ -424,11 +232,28 @@ class Evaluator:
                      simulation_seconds=result.final_time,
                      constraints={k: asdict(v) for k, v in result.constraint_records.items()},
                      elapsed_seconds=time.perf_counter() - started)
-        if verification:
-            entry.update(dt=cfg["simulation"]["dt"], initial_mass=result.initial_mass)
+        if self.settings.get('algorithm') == 'slsqp':
+            entry.update(objective_value=None, constraint_names=[], normalized_constraint_margins=[],
+                         slsqp_error=None)
+            try:
+                if candidate_class(result) not in ('feasible', 'completed_infeasible'):
+                    raise ValueError(f"SLSQP requires a fully assessed flight: {result.termination}")
+                if not result.accepted:
+                    penalties = soft_penalties(result, self.settings)
+                entry['soft_penalties'] = penalties
+                entry['objective_value'] = objective(result, self.settings, penalties=penalties)
+                names = sorted(key for key, record in result.constraint_records.items() if record.required)
+                entry['constraint_names'] = names
+                entry['normalized_constraint_margins'] = constraint_margins(result, self.settings, names)
+            except ValueError as error:
+                entry['slsqp_error'] = str(error)
         return cfg, result, entry
 
     def __call__(self, values):
+        return self.evaluate_candidate(values)[2]['score']
+
+    def evaluate_candidate(self, values):
+        """Budgeted evaluation returning config, SimResult, and persisted record."""
         if self.count >= self.settings["max_evaluations"]:
             raise EvaluationBudget
         cfg, result, entry = self.evaluate(values)
@@ -441,32 +266,45 @@ class Evaluator:
             self.best = entry
             (self.output / "best.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
             (self.output / "best.json").write_text(json.dumps(entry, indent=2, allow_nan=False))
-        progress = f"Run {self.count}/{self.settings['max_evaluations']}"
-        if self.population_size is not None:
-            generation, member = divmod(self.count - 1, self.population_size)
-            progress += f" | generation {generation} | population {member + 1}/{self.population_size}"
-        apogee = "N/A" if result.apogee is None else f"{result.apogee:,.1f} m"
-        mass = "N/A" if result.initial_mass is None else f"{result.initial_mass:.2f} kg"
-        best = "N/A" if self.best is None else f"{self.best['score']:.6g}"
-        total_wall = time.perf_counter() - self.started
-        print(
-            f"{progress} | score={score:.6g} | best={best} | apogee={apogee} | mass={mass}"
-            f" | sim={result.final_time:.2f} s | wall={entry['elapsed_seconds']:.2f} s"
-            f" | total wall={total_wall:.1f} s | avg={total_wall / self.count:.2f} s/run"
-            f" | accepted={result.accepted} | {result.termination}",
-            flush=True,
-        )
+        self.progress.update(entry)
         try:
             self.failure_monitor.observe(entry)
         except SearchFailureLimit as error:
             (self.output / 'stopped.json').write_text(json.dumps(dict(
                 reason=str(error), evaluations=self.count, last_failure=entry['failure_details']), indent=2))
             raise
-        return score
+        return cfg, result, entry
 
 
 def prepare(settings, model):
     settings = deepcopy(settings)
+    algorithm = settings.get('algorithm', 'differential_evolution')
+    if algorithm not in ('differential_evolution', 'slsqp'):
+        raise ValueError(f"Unknown optimizer algorithm: {algorithm}")
+    if algorithm == 'slsqp':
+        options = dict(maxiter=100, ftol=1e-6, gradient_step=1e-3,
+                       max_restarts=5, probe_retries=4, min_step=1e-6)
+        supplied = settings.get('slsqp', {})
+        if not isinstance(supplied, dict):
+            raise ValueError("slsqp must be a YAML mapping; indent maxiter, ftol, and gradient_step under slsqp:")
+        if set(supplied) - set(options):
+            raise ValueError(f"Unknown slsqp options: {sorted(set(supplied) - set(options))}")
+        options.update(supplied)
+        value = options['maxiter']
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("slsqp.maxiter must be a positive integer")
+        for name in ('max_restarts', 'probe_retries'):
+            value = options[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"slsqp.{name} must be a nonnegative integer")
+        for name in ('ftol', 'gradient_step', 'min_step'):
+            if isinstance(options[name], bool) or not isfinite(options[name]) or options[name] <= 0:
+                raise ValueError(f"slsqp.{name} must be finite and positive")
+        if options['gradient_step'] > 1:
+            raise ValueError("slsqp.gradient_step must not exceed the normalized range of 1")
+        if options['min_step'] > options['gradient_step']:
+            raise ValueError("slsqp.min_step must not exceed gradient_step")
+        settings['slsqp'] = options
     cfg = load_config(project_path(settings["base_config"]))
     pumps = pump_roles(cfg)
     ids = settings["tank_ids"]
@@ -535,7 +373,8 @@ def prepare(settings, model):
         if len(bounds) != 2:
             raise ValueError(f"{name} bounds require [lower, upper]")
         low, high = map(float, bounds)
-        if not all(map(isfinite, (low, high))) or low <= 0 or low > high:
+        if (not all(map(isfinite, (low, high))) or low > high
+                or (low < 0 if name == "counterweight_mass" else low <= 0)):
             raise ValueError(f"Invalid bounds for {name}")
         if name in deck and (low < deck[name][0] - 1e-12 or high > deck[name][1] + 1e-12):
             raise ValueError(f"{name} bounds exceed aero deck {deck[name]}")
@@ -548,20 +387,151 @@ def prepare(settings, model):
     for name in ("reference_mass",):
         if not isfinite(settings[name]) or settings[name] <= 0:
             raise ValueError(f"{name} must be finite and positive")
-    for name in ("max_evaluations", "maxiter", "popsize"):
+    for name in (("max_evaluations", "maxiter", "popsize") if algorithm == "differential_evolution" else ("max_evaluations",)):
         if isinstance(settings[name], bool) or int(settings[name]) != settings[name] or settings[name] < (0 if name == "maxiter" else 1):
             raise ValueError(f"{name} must be an integer in range")
     for scale in (*settings["constraint_scales"].values(), *settings["unit_scales"].values()):
         if not isfinite(scale) or scale <= 0:
             raise ValueError("Constraint scales must be finite and positive")
-    factor = settings["verification_dt_factor"]
-    if not isfinite(factor) or not 0 < factor < 1:
-        raise ValueError("verification_dt_factor must be between zero and one")
     return cfg, settings
+
+
+class LocalEvaluationError(Exception):
+    """A candidate cannot supply the objective/constraint vector required by SLSQP."""
+
+
+def run_de(evaluator, settings):
+    initial = [float(get_path(evaluator.cfg, path)) for path in evaluator.paths.values()]
+    x0 = initial if not settings.get("conditional_geometry") and all(lo <= x <= hi for x, (lo, hi) in zip(initial, evaluator.bounds)) else None
+    with GenerationBudgetSolver(evaluator, evaluator.bounds, rng=settings["seed"],
+                                popsize=settings["popsize"], maxiter=settings["maxiter"],
+                                x0=x0, polish=False, workers=1) as solver:
+        solver.solve()
+    return dict(stop="generation budget exhausted")
+
+
+class UnusableTrial(LocalEvaluationError):
+    """Recoverable physical/numerical rejection, with the normalized trial point."""
+    def __init__(self, message, point):
+        super().__init__(message)
+        self.point = np.asarray(point, dtype=float)
+
+
+def run_slsqp(evaluator, settings):
+    """Refine a valid design, shrinking probes and restarting on unusable steps."""
+    space = evaluator.coordinates
+    try:
+        z0 = space.normalize(space.encode(evaluator.cfg))
+    except (ValueError, GeometryError) as error:
+        raise LocalEvaluationError(f"Invalid SLSQP initial design: {error}") from error
+    names = None
+    options = settings['slsqp']
+
+    @lru_cache(maxsize=max(32, 2 * (len(z0) + 1)))
+    def record(z):
+        # Cache failures too: revisiting an identical failed point needs no simulation.
+        return evaluator.evaluate_candidate(space.expand(z))[2]
+
+    def evaluate(z):
+        entry = record(tuple(z))
+        if entry['slsqp_error']:
+            details = entry.get('failure_details') or {}
+            recoverable = (entry['score_class'] == 'preflight_rejected' or
+                           (details.get('fatal') is False and details.get('kind') in {
+                               'trial_domain_failure', 'solver_nonconvergence',
+                               'residual_acceptance_failure'}))
+            if recoverable:
+                raise UnusableTrial(entry['slsqp_error'], z)
+            raise LocalEvaluationError(entry['slsqp_error'])
+        if names is not None and entry['constraint_names'] != names:
+            raise LocalEvaluationError("Required constraint set changed during SLSQP")
+        return np.array([entry['objective_value'], *entry['normalized_constraint_margins']])
+
+    evaluate(z0)  # Initial failures are never recovered by searching from an unknown state.
+    initial = record(tuple(z0))
+    if not initial['accepted']:
+        raise LocalEvaluationError("SLSQP requires an accepted initial design")
+    names = initial['constraint_names']
+    if not z0:
+        return dict(stop="all variables fixed", solver_success=True, iterations=0, restarts=0)
+
+    anchor = np.asarray(z0)
+    lower, upper = np.zeros(len(z0)), np.ones(len(z0))
+    radius, iterations, restarts = 1., 0, 0
+
+    def log_recovery(kind, error, **fields):
+        event = dict(kind=kind, evaluation=evaluator.count, reason=str(error),
+                     trial=error.point.tolist(), **fields)
+        with (evaluator.output / 'recovery.jsonl').open('a') as stream:
+            stream.write(json.dumps(event, allow_nan=False) + "\n")
+        evaluator.progress.event(kind, fields)
+
+    while True:
+        # Share numerical derivatives between the objective and all constraints.
+        @lru_cache(maxsize=1)
+        def derivatives(point):
+            z = np.asarray(point)
+            baseline = evaluate(z)
+            columns = []
+            for i in range(len(z)):
+                column = None
+                for retry in range(options['probe_retries'] + 1):
+                    step = options['gradient_step'] * .5 ** retry
+                    # Prefer a full forward step, then try its opposite.
+                    direction = 1 if upper[i] - z[i] >= step else -1
+                    for sign in (direction, -direction):
+                        trial = z.copy()
+                        trial[i] = np.clip(z[i] + sign * step, lower[i], upper[i])
+                        delta = trial[i] - z[i]
+                        if abs(delta) < options['min_step'] * (1 - 1e-10):
+                            continue
+                        try:
+                            column = (evaluate(trial) - baseline) / delta
+                        except UnusableTrial as error:
+                            log_recovery('probe_retry', error, variable=space.names[space.free[i]],
+                                         step=float(delta), retry=retry)
+                            continue
+                        break
+                    if column is not None:
+                        break
+                if column is None:
+                    raise LocalEvaluationError(f"No usable derivative probe for {space.names[space.free[i]]}")
+                columns.append(column)
+            return np.column_stack(columns)
+
+        def iteration_finished(z):
+            nonlocal anchor, iterations
+            evaluate(z)
+            anchor = np.asarray(z).copy()
+            iterations += 1
+
+        try:
+            result = minimize(
+                lambda z: evaluate(z)[0], anchor, method='SLSQP',
+                jac=lambda z: derivatives(tuple(z))[0],
+                bounds=list(zip(lower, upper)),
+                constraints={'type': 'ineq', 'fun': lambda z: evaluate(z)[1:],
+                             'jac': lambda z: derivatives(tuple(z))[1:]},
+                callback=iteration_finished,
+                options=dict(maxiter=max(1, options['maxiter'] - iterations), ftol=options['ftol']))
+            return dict(stop=str(result.message), solver_success=bool(result.success),
+                        solver_status=int(result.status), iterations=iterations, restarts=restarts,
+                        recovery_radius=radius if restarts else None)
+        except UnusableTrial as error:
+            if restarts >= options['max_restarts'] or iterations >= options['maxiter']:
+                raise LocalEvaluationError(f"SLSQP recovery limit reached: {error}") from error
+            radius = .5 * min(radius, float(np.max(np.abs(error.point - anchor))))
+            if radius < options['min_step']:
+                raise LocalEvaluationError(f"SLSQP recovery radius below min_step: {error}") from error
+            restarts += 1
+            lower, upper = np.maximum(0., anchor - radius), np.minimum(1., anchor + radius)
+            log_recovery('restart', error, restart=restarts, radius=radius, anchor=anchor.tolist())
 
 
 def optimize(settings, output, *, workers=None, timeout=None, candidates_per_worker=None,
              resume=False, profile=False):
+    if settings.get('algorithm', 'differential_evolution') not in ('differential_evolution', 'slsqp'):
+        raise ValueError(f"Unknown optimizer algorithm: {settings['algorithm']}")
     workers = settings.get('workers', 1) if workers is None else workers
     timeout = settings.get('worker_timeout', 300.) if timeout is None else timeout
     candidates_per_worker = (settings.get('candidates_per_worker', 3)
@@ -571,6 +541,8 @@ def optimize(settings, output, *, workers=None, timeout=None, candidates_per_wor
             raise ValueError(f'{name} must be a positive integer')
     if not isfinite(timeout) or timeout <= 0:
         raise ValueError('worker timeout must be finite and positive')
+    if settings.get('algorithm') == 'slsqp' and (workers > 1 or resume or profile):
+        raise ValueError("SLSQP supports serial execution only; workers, resume, and profile are unavailable")
     if workers > 1 or resume or profile:
         from optimizer.workers import optimize_parallel
         return optimize_parallel(settings, output, workers=workers, timeout=timeout,
@@ -585,30 +557,21 @@ def optimize(settings, output, *, workers=None, timeout=None, candidates_per_wor
     (output / "search.yaml").write_text(yaml.safe_dump(settings, sort_keys=False))
     (output / "base.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     evaluator = Evaluator(cfg, settings, model, pure, combustion, output)
-    initial = [float(get_path(cfg, path)) for path in evaluator.paths.values()]
-    x0 = initial if not settings.get("conditional_geometry") and all(lo <= x <= hi for x, (lo, hi) in zip(initial, evaluator.bounds)) else None
     try:
-        with GenerationBudgetSolver(evaluator, evaluator.bounds, rng=settings["seed"],
-                                    popsize=settings["popsize"], maxiter=settings["maxiter"],
-                                    x0=x0, polish=False, workers=1) as solver:
-            evaluator.population_size = solver.num_population_members
-            print(f"Search: {settings['max_evaluations']} evaluations, "
-                  f"{evaluator.population_size} candidates per population; "
-                  "generation 0 is the initial population.", flush=True)
-            solver.solve()
-        stop = "generation budget exhausted"
+        outcome = (run_slsqp(evaluator, settings) if settings.get('algorithm') == 'slsqp'
+                   else run_de(evaluator, settings))
     except EvaluationBudget:
-        stop = "evaluation budget exhausted"
-    verified = None
-    if evaluator.best is not None:
-        cfg, result, report = evaluator.evaluate(load_config(output / "best.yaml"), verification=True)
-        (output / "verification.json").write_text(json.dumps(report, indent=2, allow_nan=False))
-        verified = result.accepted
-        if verified:
-            (output / "verified.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
-    summary = dict(evaluations=evaluator.count, stop=stop, accepted=verified is True,
-                   search_accepted=evaluator.best is not None, verified=verified,
+        outcome = dict(stop="evaluation budget exhausted")
+        if settings.get("algorithm") == "slsqp":
+            outcome["solver_success"] = False
+    except LocalEvaluationError as error:
+        outcome = dict(stop=str(error), solver_success=False)
+    summary = dict(evaluations=evaluator.count, **outcome,
+                   accepted=evaluator.best is not None,
+                   search_accepted=evaluator.best is not None,
                    best_mass=None if evaluator.best is None else evaluator.best["mass"])
+    if settings.get("algorithm") == "slsqp":
+        summary["algorithm"] = "slsqp"
     (output / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary
 
@@ -618,6 +581,7 @@ def main():
     parser.add_argument("config", nargs="?", default="Configs/optimizer_pressure_fed.yaml")
     parser.add_argument("--output", required=True, help="New directory for this search")
     parser.add_argument("--max-evaluations", type=int)
+    parser.add_argument("--algorithm", choices=("differential_evolution", "slsqp"))
     parser.add_argument('--workers', type=int, help='Concurrent candidate processes (default: config workers or 1)')
     parser.add_argument('--timeout', type=float, help='Wall-time limit in seconds per worker candidate (default: 300)')
     parser.add_argument('--candidates-per-worker', type=int, help='Recycle after this many candidates (default: 3)')
@@ -625,6 +589,8 @@ def main():
     parser.add_argument('--profile', action='store_true', help='Collect per-candidate timings in worker processes')
     args = parser.parse_args()
     settings = load_config(args.config)
+    if args.algorithm is not None:
+        settings["algorithm"] = args.algorithm
     if args.max_evaluations is not None:
         settings["max_evaluations"] = args.max_evaluations
     summary = optimize(settings, args.output, workers=args.workers, timeout=args.timeout,
@@ -632,4 +598,4 @@ def main():
                        resume=args.resume, profile=args.profile)
     print(json.dumps(summary, indent=2))
     if not summary["accepted"]:
-        print("No accepted design survived verification." if summary["search_accepted"] else "No accepted design found.")
+        print("No accepted design found.")

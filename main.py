@@ -6,7 +6,6 @@ import csv
 import json
 from copy import deepcopy
 from pathlib import Path
-
 from Configs.loader import load_config
 from simulation import ROOT, project_path, simulate
 from reporting.run_report import build_run_tables
@@ -43,7 +42,7 @@ def main() -> None:
         "config",
         nargs="?",
         type=Path,
-        default=ROOT / "Configs" / "flight_pressure_fed_regulator.yaml"
+        default=ROOT / "Configs" / "Pressurefed" / "flight_pressure_fed_search12_best.yaml"
     )
     parser.add_argument("--dt", type=float)
     parser.add_argument("--t-end", type=float)

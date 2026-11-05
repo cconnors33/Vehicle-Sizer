@@ -1,21 +1,13 @@
-"""Continuous node physics for the fluid network.
-
-residuals are unscaled SI equations. Components own event guards and state
-mapping; the assembler owns scaling, y/ydot, constraints and restarts (event handling).
-"""
+"""Node physics, residuals are unscaled and in SI. Components own event state."""
 
 from copy import deepcopy
 from math import isfinite
-
 import numpy as np
-
 from .FluidState import BranchState, FluidState, NodeState
 from .events import Event
 from diagnostics.errors import TrialDomainError, UnsupportedPhaseChangeError
 
-
 Adjacent = list[tuple[float, BranchState]]
-
 
 def iter_flows(adjacent):
     for incidence, branch in adjacent:
@@ -23,13 +15,11 @@ def iter_flows(adjacent):
             for flow in branch.flows.values():
                 yield incidence, flow
 
-
 def net_mdot(adjacent, fluid=None, phase=None):
     return sum(incidence * float(flow["mdot"])
                for incidence, flow in iter_flows(adjacent)
                if (fluid is None or flow["fluid"].fluid == fluid)
                and (phase is None or flow["fluid"].phase == phase))
-
 
 def fluxes(adjacent, fluid=None):
     mass, energy = 0.0, 0.0
@@ -40,7 +30,6 @@ def fluxes(adjacent, fluid=None):
             energy += q * float(flow["fluid"]["h"])
     return mass, energy
 
-
 def inventory_residual(*, mass_rate, energy_rate, adjacent, fluid=None,
                        heat_rate=0.0, pressure=0.0, volume_rate=0.0):
     """Return [mass, energy] residuals in kg/s and W; inflows/heat are positive."""
@@ -48,14 +37,12 @@ def inventory_residual(*, mass_rate, energy_rate, adjacent, fluid=None,
     return np.array([mass_rate - mdot,
                      energy_rate - hdot - heat_rate + pressure * volume_rate])
 
-
 def _incoming(adjacent):
     # Direction is fixed by the network during an integration segment, rather
     # than selected from a possibly wrong-sign nonlinear trial flow.
     return {flow["fluid"].fluid: flow["fluid"]
             for incidence, flow in iter_flows(adjacent)
             if incidence * flow["direction"] > 0}
-
 
 class FluidNode:
     """Component definition/mode and local equations, without a stored solution.
@@ -263,7 +250,7 @@ class VolumeComponent(FluidNode):
         if not np.isfinite(self.volume) or self.volume <= 0:
             raise ValueError("Tank volume must be finite and positive")
         self.set_mode(phase)
-        self._triple_limits = {}
+        self._triple_point = {}
 
     @property
     def fluid_name(self):
@@ -355,10 +342,10 @@ class VolumeComponent(FluidNode):
             for fluid, temperature in names:
                 if not self.fluid_properties.supports_saturation(fluid):
                     continue
-                if fluid not in self._triple_limits:
+                if fluid not in self._triple_point:
                     low, _ = self.fluid_properties.saturation_bounds(fluid)
-                    self._triple_limits[fluid] = (low, self.fluid_properties.saturation_at_p(fluid, low).T)
-                low_p, low_t = self._triple_limits[fluid]
+                    self._triple_point[fluid] = (low, self.fluid_properties.saturation_at_p(fluid, low).T)
+                low_p, low_t = self._triple_point[fluid]
                 variable, limit = ("P", low_p) if self.mode == "saturated" else (temperature, low_t)
                 margin = (context.values[self.id][variable] - limit - 10 * errors[variable]) / limit
                 events[f"triple_point:{fluid}"] = Event(margin, terminal="triple_point")
@@ -400,7 +387,7 @@ class PropellantTankComponent(VolumeComponent):
         m0 = float(self.definition["state0"]["m_liq"])
         if m0 < 0 or not np.isfinite(m0):
             raise ValueError("Initial liquid mass must be finite and nonnegative")
-        self.dry_mass = max(min(m0 * 1e-5, 1e-5), 1e-12)
+        self.dryout_threshold = max(min(m0 * 1e-5, 1e-5), 1e-12)
         self.set_mode("two_phase" if m0 > 0 else "gas")
 
     @property
@@ -452,49 +439,47 @@ class PropellantTankComponent(VolumeComponent):
 
     @staticmethod
     def _thermodynamic_response(m_l, m_g, liquid, gas, dl, dg):
-        """Return liquid-volume and pressure gradients along the EOS closures.
-        """
-        inputs = (m_l, m_g, liquid.rho, gas.rho, liquid.u, gas.u,
-                  dl['drho_dP'], dl['drho_dT'], dl['du_dP'], dl['du_dT'],
-                  dg['drho_dP'], dg['drho_dT'], dg['du_dP'], dg['du_dT'])
-        if (not all(map(isfinite, inputs)) or min(m_l, m_g, liquid.rho, gas.rho) <= 0
-                or dl['du_dT'] == 0 or dg['du_dT'] == 0):
+        """Return liquid-volume and pressure gradients, this is used to satisfy the energy equations"""
+
+        inputs = (m_l, m_g, liquid.rho, gas.rho, liquid.u, gas.u, 
+                  dl['drho_dP'], dl['drho_dT'], dl['du_dP'], dl['du_dT'], dg['drho_dP'], dg['drho_dT'], dg['du_dP'], dg['du_dT'])
+        
+        if (not all(map(isfinite, inputs)) or min(m_l, m_g, liquid.rho, gas.rho) <= 0 or dl['du_dT'] == 0 or dg['du_dT'] == 0):
             raise TrialDomainError('Invalid liquid/ullage thermodynamic response inputs')
-        # Cancel phase mass before division: small inventories need no cutoff.
+   
         fb = -dl['drho_dT'] / liquid.rho**2 / dl['du_dT']
         gd = -dg['drho_dT'] / gas.rho**2 / dg['du_dT']
         lp, gp = -m_l * dl['drho_dP'] / liquid.rho**2, -m_g * dg['drho_dP'] / gas.rho**2
         lt, gt = fb * m_l * dl['du_dP'], gd * m_g * dg['du_dP']
         kl, kg = lp - lt, gp - gt
         denominator = kl + kg
+
         scale = max(abs(lp), abs(gp), abs(lt), abs(gt))
-        if (not all(map(isfinite, (fb, gd, denominator, scale))) or scale == 0
-                or abs(denominator) <= 1e-10 * scale):
-            raise TrialDomainError(
-                f'Singular liquid/ullage thermodynamic response: denominator={denominator:g}, scale={scale:g}')
+        if (not all(map(isfinite, (fb, gd, denominator, scale))) or scale == 0 or abs(denominator) <= 1e-10 * scale):
+            raise TrialDomainError(f'Singular liquid/ullage thermodynamic response: denominator={denominator:g}, scale={scale:g}')
         ql, qg = 1 / liquid.rho - fb * liquid.u, 1 / gas.rho - gd * gas.u
         pressure = np.array([-ql, -qg, -fb, -gd]) / denominator
-        # Use kg/(kl+kg), instead of 1-kl/(kl+kg), to avoid cancellation.
+  
         gradient = np.array([ql * (kg / denominator), -qg * (kl / denominator),
                              fb * (kg / denominator), -gd * (kl / denominator)])
         if not np.isfinite(gradient).all() or not np.isfinite(pressure).all():
             raise TrialDomainError('Non-finite liquid/ullage thermodynamic response')
+        
         return gradient, pressure
 
-    def evaluate(self, trial_values, adjacent=(), node_states_by_id=None, *,
-                 axial_specific_force=0.0, boundary_values=None):
+    def evaluate(self, trial_values, adjacent=(), node_states_by_id=None, *, axial_specific_force=0.0, boundary_values=None):
+        
         if self.mode != "two_phase":
-            return super().evaluate(trial_values, adjacent, node_states_by_id,
-                                    axial_specific_force=axial_specific_force, boundary_values=boundary_values)
+            return super().evaluate(trial_values, adjacent, node_states_by_id, axial_specific_force=axial_specific_force, boundary_values=boundary_values)
         self._check_trial_values(trial_values)
+
         m_l, m_g, pressure = trial_values["m_liq"], trial_values["m_ull"], trial_values["P"]
-        if m_l <= 0 or m_g <= 0:
-            raise TrialDomainError("Wet tank requires positive liquid and ullage inventories")
+        if m_l <= 0 or m_g <= 0: raise TrialDomainError("Wet tank requires positive liquid and ullage inventories")
+        
         liquid_name, gas_name = self.definition["liquid_fluid"], self.definition["gas_fluid"]
         liquid = self.fluid_properties.state_pt(liquid_name, pressure, trial_values["T_liq"])
         gas = self.fluid_properties.state_pt(gas_name, pressure, trial_values["T_ull"])
-        if any(not np.isfinite(f.rho) or f.rho <= 0 for f in (liquid, gas)):
-            raise TrialDomainError("Tank properties require finite positive densities")
+        if any(not np.isfinite(f.rho) or f.rho <= 0 for f in (liquid, gas)): raise TrialDomainError("Tank properties require finite positive densities")
         dl = self.fluid_properties.derivatives_pt(liquid_name, pressure, trial_values["T_liq"])
         dg = self.fluid_properties.derivatives_pt(gas_name, pressure, trial_values["T_ull"])
         vl, vg = m_l / liquid.rho, m_g / gas.rho
@@ -531,7 +516,7 @@ class PropellantTankComponent(VolumeComponent):
 
     def event_values(self, node_state):
         if self.mode == "two_phase":
-            return {"dryout": node_state["m_liq"] - self.dry_mass,
+            return {"dryout": node_state["m_liq"] - self.dryout_threshold,
                     **self._property_limits(self.definition["liquid_fluid"], node_state["P"], node_state["T_liq"], "liquid_"),
                     **self._property_limits(self.definition["gas_fluid"], node_state["P"], node_state["T_ull"], "ullage_")}
         return super().event_values(node_state)
@@ -540,7 +525,7 @@ class PropellantTankComponent(VolumeComponent):
         events = super().events(context)
         if self.mode == "two_phase":
             rate = context.rates[self.id]["m_liq"]
-            tolerance = min(.01 * self.dry_mass,
+            tolerance = min(.01 * self.dryout_threshold,
                             max(10 * context.atol[self.id]["m_liq"], abs(rate) * context.options["event_time_tolerance"]))
             events["dryout"] = Event(events["dryout"].value, at_zero=True,
                                     coincident=rate < 0 and events["dryout"].value <= tolerance)
@@ -553,7 +538,7 @@ class PropellantTankComponent(VolumeComponent):
             return {}
         remainder = dict(time_s=time, node=self.id, fluid=self.definition["liquid_fluid"],
                          mass=values["m_liq"], energy=values["U_liq"])
-        if not 0 <= remainder["mass"] <= 1.01 * self.dry_mass:
+        if not 0 <= remainder["mass"] <= 1.01 * self.dryout_threshold:
             raise RuntimeError("Dryout mapping exceeded the numerical remainder budget")
         mapped = dict(m=values["m_ull"], U=values["U_ull"], P=values["P"], T=values["T_ull"])
         values.clear()

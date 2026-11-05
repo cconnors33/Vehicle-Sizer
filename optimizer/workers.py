@@ -129,9 +129,7 @@ def worker(output, indices):
                     last_progress[0] = now
                     if timing is not None and timing.enabled:
                         timing.save(job/'timings.json')
-            verification = settings.get('verification', False)
-            _, _, row = evaluator.evaluate(
-                cfg if verification else task['coordinates'], verification=verification, progress=progress)
+            _, _, row = evaluator.evaluate(task['coordinates'], progress=progress)
             if check_sources(output) != source_version:
                 raise RuntimeError('Sources changed while evaluating this candidate; discard this evaluation')
             row.update(evaluation=index, index=index, coordinates=task['coordinates'], patch_version=patch_version, source_version=source_version,
@@ -268,6 +266,8 @@ def launch_batch(output, tasks, timeout, *, stop_event=None):
 
 def optimize_parallel(settings, output, *, workers, timeout=300., candidates_per_worker=3,
                       resume=False, profile=False):
+    if settings is not None and settings.get('algorithm', 'differential_evolution') != 'differential_evolution':
+        raise ValueError("Process-worker searches support differential_evolution only")
     output = Path(output).resolve()
     if output.exists() and not resume:
         raise FileExistsError(f'Output directory already exists: {output}; use --resume to continue it')
@@ -292,9 +292,12 @@ def optimize_parallel(settings, output, *, workers, timeout=300., candidates_per
             _, prepared = opt.prepare(requested, model)
             if yaml.safe_load(yaml.safe_dump(prepared)) != settings:
                 raise ValueError('Resume settings differ from the saved search; use the original config and evaluation budget')
+    if settings.get('algorithm', 'differential_evolution') != 'differential_evolution':
+        raise ValueError("Process-worker searches support differential_evolution only")
     names = list(opt.variable_paths(cfg, settings['tank_ids']))
     bounds = [settings['bounds'][name] for name in names]
     budget, count = settings['max_evaluations'], 0
+    progress = opt.ProgressTracker(budget)
     rows = {}
     monitor = opt.FailureMonitor(settings.get('failure_policy'))
     stop_workers = Event()
@@ -315,8 +318,7 @@ def optimize_parallel(settings, output, *, workers, timeout=300., candidates_per
                            failure_kinds=dict(Counter(r.get('failure_details', {}).get('kind')
                                for r in rows.values() if r.get('failure_details'))),
                            best_score=min(r['score'] for r in rows.values()), latest_index=row['index']), optional=True)
-                print(f"{row['index']}/{budget}: {row['score_class']} score={row['score']:.7g} "
-                      f"apogee={row.get('apogee')} wall={row['wall_seconds']:.1f}s", flush=True)
+                progress.update(row)
         count += available
         # Observe in candidate order, not nondeterministic worker completion order.
         for index, _ in tasks:
@@ -353,21 +355,10 @@ def optimize_parallel(settings, output, *, workers, timeout=300., candidates_per
     (output/'evaluations.jsonl').write_text(''.join(json.dumps(r, allow_nan=False)+'\n' for r in ordered))
     best = min(ordered, key=lambda r: r['score'])
     accepted = [r for r in ordered if r['accepted']]
-    verified = None
     if accepted:
         winner = min(accepted, key=lambda r: r['score'])
         (output/'best.yaml').write_text((output/'candidates'/f"{winner['index']:04d}"/'candidate.yaml').read_text())
         write_json(output/'best.json', winner)
-        verification = output/'verification'
-        verification.mkdir(exist_ok=True)
-        shutil.copyfile(output/'best.yaml', verification/'base.yaml')
-        (verification/'search.yaml').write_text(yaml.safe_dump(dict(settings, verification=True), sort_keys=False))
-        shutil.copyfile(output/'diagnostic_fixes.py', verification/'diagnostic_fixes.py')
-        verification_result = launch_batch(verification, [(1, [])], 2*timeout)[0]
-        write_json(output/'verification.json', verification_result)
-        verified = verification_result['accepted']
-        if verified:
-            shutil.copyfile(verification/'candidates'/'0001'/'candidate.yaml', output/'verified.yaml')
     summary = dict(evaluations=len(ordered), counts=dict(Counter(r['termination'] for r in ordered)),
                    failure_kinds=dict(Counter(r['failure_details']['kind'] for r in ordered if r.get('failure_details'))),
                    recovered_native_candidates=sum(bool(r.get('worker_attempts')) and r['score_class'] != 'unresolved'
@@ -375,9 +366,9 @@ def optimize_parallel(settings, output, *, workers, timeout=300., candidates_per
                    generations=generation,
                    stop='evaluation budget exhausted' if count >= budget else 'generation budget exhausted',
                    classes=dict(Counter(r['score_class'] for r in ordered)),
-                   accepted=verified is True, accepted_candidates=len(accepted), search_accepted=bool(accepted),
+                   accepted=bool(accepted), accepted_candidates=len(accepted), search_accepted=bool(accepted),
                    best_mass=winner.get('mass') if accepted else None,
-                   best_index=best['index'], best_score=best['score'], verified=verified,
+                   best_index=best['index'], best_score=best['score'],
                    elapsed_this_invocation=time.perf_counter()-started,
                    candidate_seconds=sum(r['wall_seconds'] for r in ordered))
     write_json(output/'summary.json', summary)

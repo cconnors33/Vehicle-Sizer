@@ -1,0 +1,145 @@
+# Local fin and counterweight refinement of flight_pressure_fed_search12_best.
+# Counterweight: 1-6 kg. Fins: +/-5% of base values, capped to aero-table limits.
+# All other design variables remain fixed.
+
+base_config: Configs/Pressurefed/flight_pressure_fed_search12_best.yaml
+tank_ids:
+  oxidizer: ox_tank
+  fuel: fuel_tank
+  pressurant: press_tank
+workers: 1
+max_evaluations: 1000
+algorithm: slsqp
+reference_mass: 190.0
+hard_constraints:
+- tank.ox_tank.wall_min
+- tank.fuel_tank.wall_min
+- max_length_to_diameter
+- goal_apogee
+- max_burn_duration
+- min_stability_calibers
+- tank.fuel_tank.Tmin
+- tank.fuel_tank.Pmin
+- tank.ox_tank.Tmin
+- tank.ox_tank.Pmin
+- tank.press_tank.Tmin
+- tank.press_tank.Pmin
+soft_penalties:
+  downrange:
+    target_m: 32000.0
+    scale_m: 10000.0
+    weight: 0.5
+  stability_length_fraction:
+    lower_target: 0.1
+    upper_target: 0.2
+    scale: 0.05
+    weight: 0.15
+  max_q:
+    target_pa: 145000.0
+    scale_pa: 10000.0
+    weight: 0.0
+conditional_geometry: false
+failure_policy:
+  native_retries: 1
+  consecutive_limit: 50
+  window: 100
+  rate_limit: 0.95
+  repeated_limit: 3
+evaluation_overrides:
+  tanks.ox_tank.min_wall_thickness: 0.00254
+  tanks.fuel_tank.min_wall_thickness: 0.00254
+  tanks.press_tank.mass: 29.5
+  tanks.fuel_tank.min_temperature: 80.0
+  tanks.fuel_tank.min_pressure: 68947.57293168
+  tanks.ox_tank.min_temperature: 80.0
+  tanks.ox_tank.min_pressure: 68947.57293168
+  tanks.press_tank.min_pressure: 1.034e6
+  tanks.press_tank.min_temperature: 120.0
+  constraints.max_length_to_diameter: 31.0
+  constraints.min_stability_calibers: 2.0
+  constraints.goal_apogee: 130000.0
+  constraints.max_burn_duration: 75.0
+  simulation.t_end: 600.0
+  environment.max_altitude: 300000.0
+bounds:
+  counterweight_mass:
+  - 1.0
+  - 10.0
+  exit_pressure:
+  - 59096.95801911459
+  - 59096.95801911459
+  omld:
+  - 0.31115
+  - 0.31115
+  fineness:
+  - 5.30
+  - 6.00
+  boattail_aft:
+  - 0.27896114988136606
+  - 0.27896114988136606
+  boattail_length:
+  - 0.5400125094145363
+  - 0.5400125094145363
+  span:
+  - 0.302454807634362
+  - 0.3342921558064001
+  root:
+  - 0.4826
+  - 0.508
+  tip:
+  - 0.19304
+  - 0.2032
+  sweep_fraction:
+  - 0.7218058977391113
+  - 0.7977854659221757
+  thickness:
+  - 0.0075
+  - 0.0075
+  chamber_pressure:
+  - 1759943.716457859
+  - 1759943.716457859
+  mixture_ratio:
+  - 2.1742499551880994
+  - 2.1742499551880994
+  thrust:
+  - 24178.491606506825
+  - 26178.491606506825
+  copv_pressure:
+  - 21627914.667066757
+  - 21627914.667066757
+  copv_volume:
+  - 0.055
+  - 0.055
+  oxidizer_mass:
+  - 215.7980907391658
+  - 215.7980907391658
+  fuel_mass:
+  - 93.1249687554799
+  - 93.1249687554799
+constraint_scales:
+  tank.ox_tank.wall_min: 0.001
+  tank.fuel_tank.wall_min: 0.001
+  max_length_to_diameter: 5.0
+  max_aoa_deg: 1.0
+  goal_apogee: 10000.0
+  max_burn_duration: 5.0
+  max_q: 10000.0
+  min_stability_calibers: 0.5
+  min_rail_twr: 0.2
+unit_scales:
+  deg: 1.0
+  m: 0.01
+  Pa: 1000000.0
+  K: 10.0
+  s: 5.0
+  kW: 5.0
+  calibers: 1.0
+  '1': 1.0
+profile: false
+slsqp:
+  maxiter: 100
+  ftol: 1.0e-06
+  gradient_step: 0.001
+  probe_retries: 4
+  min_step: 1.0e-06
+  max_restarts: 5

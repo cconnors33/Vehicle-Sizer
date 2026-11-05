@@ -83,6 +83,32 @@ def test_decode_changes_all_19_inputs_without_mutating_fixed_choices(settings, t
     assert candidate['tanks']['press_tank']['outer_diameter'] == cfg['tanks']['press_tank']['outer_diameter']
 
 
+def test_counterweight_decode_and_section_placement(settings, tmp_path):
+    cfg = load_config(settings['base_config'])
+    cfg['vehicle']['sections'][1].setdefault('masses', {})['counterweight'] = 10.
+    before = deepcopy(cfg)
+    settings['bounds']['counterweight_mass'] = [0., 20.]
+    evaluator = opt.Evaluator(cfg, settings, None, None, None, tmp_path)
+    x = np.mean(evaluator.bounds, axis=1)
+    x[evaluator.names.index('counterweight_mass')] = 0.
+    candidate = evaluator.decode(x)
+    assert candidate['vehicle']['sections'][1]['masses']['counterweight'] == 0.
+    assert cfg == before
+    cfg['vehicle']['sections'][0].setdefault('masses', {})['counterweight'] = 1.
+    with pytest.raises(ValueError, match='only one optimizer counterweight'):
+        opt.variable_paths(cfg, settings['tank_ids'])
+
+
+def test_counterweight_bounds_allow_zero_but_not_negative():
+    settings = load_config('Configs/optimizer_pressure_fed.yaml')
+    model = opt.DragModel()
+    settings['bounds']['counterweight_mass'] = [0., 0.]
+    opt.prepare(settings, model)
+    settings['bounds']['counterweight_mass'] = [-1., 20.]
+    with pytest.raises(ValueError, match='Invalid bounds for counterweight_mass'):
+        opt.prepare(settings, model)
+
+
 def test_real_deck_bounds_preparation_and_derived_domain(settings):
     model = opt.DragModel()
     cfg, prepared = opt.prepare(settings, model)
@@ -231,31 +257,24 @@ def test_real_scipy_budget_and_no_false_winner(settings, tmp_path):
          patch.object(opt, 'simulate', return_value=result):
         summary = opt.optimize(settings, tmp_path / 'run')
     assert summary == dict(evaluations=3, stop='evaluation budget exhausted', accepted=False,
-                           search_accepted=False, verified=None, best_mass=None)
+                           search_accepted=False, best_mass=None)
     assert not (tmp_path / 'run' / 'best.yaml').exists()
     with pytest.raises(FileExistsError):
         opt.optimize(settings, tmp_path / 'run')
 
 
-@pytest.mark.parametrize('passes', [True, False])
-def test_verification_can_reject_search_winner(settings, tmp_path, passes):
+def test_search_winner_is_final_without_an_extra_simulation(settings, tmp_path):
     settings['max_evaluations'] = 1
-    result = accepted()
-    if not passes:
-        result.apogee = None
     with patch.object(opt, 'property_sources', return_value=(None, None)), \
-         patch.object(opt, 'simulate', side_effect=[accepted(), result]) as simulate:
+         patch.object(opt, 'simulate', return_value=accepted()) as simulate:
         summary = opt.optimize(settings, tmp_path / 'run')
-    output = tmp_path / 'run'
-    cfg = load_config(output / 'best.yaml')
-    call = simulate.call_args
-    assert call.args[0]['simulation']['dt'] == cfg['simulation']['dt'] * .5
-    assert call.kwargs['compute_loads'] is True
-    assert (output / 'verified.yaml').exists() is passes
-    assert json.loads((output / 'verification.json').read_text())['accepted'] is passes
-    assert summary['verified'] is passes
-    assert summary['evaluations'] == 1
-
+    assert simulate.call_count == summary['evaluations'] == 1
+    assert summary['accepted']
+    assert 'verified' not in summary
+    assert (tmp_path / 'run' / 'best.yaml').exists()
+    assert not (tmp_path / 'run' / 'verification.json').exists()
+    assert not (tmp_path / 'run' / 'verified.yaml').exists()
+    assert simulate.call_args.kwargs['compute_loads'] is False
 
 
 def test_class_order_dominates_violation_size(settings):
@@ -336,25 +355,3 @@ def test_evaluation_budget_interrupts_a_generation():
         with pytest.raises(opt.EvaluationBudget):
             solver.solve()
     assert len(calls) == 11
-
-
-@pytest.mark.parametrize('failure', ['atmosphere', 'solver'])
-def test_shared_verification_fails_explicitly_without_decoding(settings, tmp_path, failure):
-    from diagnostics.errors import SolverConvergenceError
-    cfg = load_config(settings['base_config'])
-    cfg['tanks']['press_tank']['volume'] = .02
-    before = deepcopy(cfg)
-    evaluator = opt.Evaluator(cfg, settings, None, None, None, tmp_path)
-    result = accepted()
-    result.max_altitude = cfg['environment']['max_altitude'] + 1
-    error = EvaluationFailure('runtime', cfg, result)
-    error.__cause__ = SolverConvergenceError('integration', -4, 1.)
-    with patch.object(evaluator, 'decode', side_effect=AssertionError('must not decode')), \
-         patch.object(opt, 'simulate', return_value=result,
-                      side_effect=error if failure == 'solver' else None):
-        with pytest.raises(EvaluationFailure):
-            evaluator.evaluate(cfg, verification=True)
-    assert cfg == before
-    assert evaluator.count == 0
-    assert (tmp_path/'failure.txt').exists()
-    assert not (tmp_path/'verified.yaml').exists()

@@ -50,7 +50,7 @@ Run an optimization with a new output directory:
 .venv/bin/python -m optimizer Configs/optimizer_pressure_fed.yaml --output outputs/search_01
 ```
 
-The search writes configs, evaluation records, failure details, and a summary. Accepted designs produce `best.yaml`; successful verification produces `verified.yaml`. Use `--max-evaluations` to limit the search.
+The search writes configs, evaluation records, failure details, and a summary. The best accepted design produces `best.yaml` and `best.json`; no additional simulation runs after the search. Use `--max-evaluations` to limit the search.
 Run independent candidates in separate processes with `--workers`:
 
 ```bash
